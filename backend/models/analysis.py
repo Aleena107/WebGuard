@@ -7,6 +7,12 @@ class Analysis(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
 
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id"),
+        nullable=True
+    )
+
     url = db.Column(db.String(2048), nullable=False)
 
     risk_score = db.Column(db.Integer, nullable=False)
@@ -29,3 +35,4 @@ class Analysis(db.Model):
         db.DateTime,
         default=datetime.utcnow
     )
+    

@@ -1,20 +1,103 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from urllib.parse import urlparse
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
+
 from config import Config
 from database import db
-
 from models.analysis import Analysis
+from models.user import User
+
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    jwt_required,
+    get_jwt_identity
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from llm_service import generate_explanation
 
 app = Flask(__name__)
 app.config.from_object(Config)
+
 db.init_app(app)
+jwt = JWTManager(app)
 CORS(app)
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json()
+
+    name = data.get("name")
+    email = data.get("email")
+    password = data.get("password")
+
+    if not name or not email or not password:
+        return jsonify({
+            "status": "error",
+            "message": "Name, email and password are required"
+        }), 400
+
+    existing_user = User.query.filter_by(email=email).first()
+
+    if existing_user:
+        return jsonify({
+            "status": "error",
+            "message": "Email already registered"
+        }), 409
+
+    hashed_password = generate_password_hash(password)
+
+    user = User(
+        name=name,
+        email=email,
+        password=hashed_password
+    )
+
+    db.session.add(user)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "User registered successfully"
+    }), 201
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({
+            "status": "error",
+            "message": "Email and password are required"
+        }), 400
+
+    user = User.query.filter_by(email=email).first()
+
+    if not user or not check_password_hash(user.password, password):
+        return jsonify({
+            "status": "error",
+            "message": "Invalid email or password"
+        }), 401
+
+    access_token = create_access_token(identity=str(user.id))
+
+    return jsonify({
+        "status": "success",
+        "data": {
+            "access_token": access_token,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email
+            }
+        }
+    })
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
@@ -25,7 +108,9 @@ def health_check():
 
 
 @app.route("/api/analyze", methods=["POST"])
-def analyze_url():
+@jwt_required()
+def analyze():
+    user_id = int(get_jwt_identity())
     data = request.get_json()
 
     if not data or "url" not in data:
@@ -43,6 +128,16 @@ def analyze_url():
         }), 400
 
     parsed_url = urlparse(url)
+
+    # Validate URL before trying to fetch it
+    if not parsed_url.scheme or not parsed_url.netloc:
+        return jsonify({
+            "status": "error",
+            "message": "Please enter a valid URL"
+        }), 400
+
+    # Default value in case webpage fetching fails
+    password_field_count = 0
 
     try:
         response = requests.get(
@@ -90,14 +185,13 @@ def analyze_url():
             "forms": 0,
             "links": 0,
             "images": 0,
-            "scripts": 0
+            "scripts": 0,
+            "password_fields": 0
         }
 
-    if not parsed_url.scheme or not parsed_url.netloc:
-        return jsonify({
-            "status": "error",
-            "message": "Please enter a valid URL"
-        }), 400
+    # -----------------------------
+    # Risk scoring
+    # -----------------------------
 
     score = 0
     signals = []
@@ -105,6 +199,7 @@ def analyze_url():
     # Check HTTPS
     if parsed_url.scheme != "https":
         score += 15
+
         signals.append({
             "name": "HTTPS not enabled",
             "points": 15,
@@ -114,6 +209,7 @@ def analyze_url():
     # Check URL length
     if len(url) > 75:
         score += 10
+
         signals.append({
             "name": "Unusually long URL",
             "points": 10,
@@ -132,12 +228,14 @@ def analyze_url():
     ]
 
     found_keywords = [
-        keyword for keyword in suspicious_keywords
+        keyword
+        for keyword in suspicious_keywords
         if keyword in url.lower()
     ]
 
     if found_keywords:
         score += 15
+
         signals.append({
             "name": "Suspicious keywords detected",
             "points": 15,
@@ -145,7 +243,7 @@ def analyze_url():
             "keywords": found_keywords
         })
 
-        # Check for suspicious URL characters
+    # Check suspicious URL characters
     suspicious_characters = ["@", "//"]
 
     found_patterns = [
@@ -168,13 +266,14 @@ def analyze_url():
 
     if hostname.replace(".", "").isdigit():
         score += 25
+
         signals.append({
             "name": "IP address used instead of domain",
             "points": 25,
             "severity": "high"
         })
 
-        # Check for password fields
+    # Check for password fields
     if password_field_count > 0:
         score += 20
 
@@ -192,7 +291,12 @@ def analyze_url():
     else:
         risk_level = "Low"
 
+    # -----------------------------
+    # Save analysis to MySQL
+    # -----------------------------
+
     analysis = Analysis(
+        user_id=user_id,
         url=url,
         risk_score=score,
         risk_level=risk_level,
@@ -219,8 +323,87 @@ def analyze_url():
         }
     })
 
+
+@app.route("/api/analyses", methods=["GET"])
+@jwt_required()
+def get_analyses():
+    user_id = int(get_jwt_identity())
+
+    analyses = Analysis.query.filter_by(user_id=user_id).order_by(
+        Analysis.created_at.desc()
+    ).all()
+
+    results = []
+
+    for analysis in analyses:
+        results.append({
+            "id": analysis.id,
+            "url": analysis.url,
+            "risk_score": analysis.risk_score,
+            "risk_level": analysis.risk_level,
+            "page_title": analysis.page_title,
+            "forms": analysis.forms,
+            "links": analysis.links,
+            "images": analysis.images,
+            "scripts": analysis.scripts,
+            "password_fields": analysis.password_fields,
+            "created_at": analysis.created_at.isoformat()
+        })
+
+    return jsonify({
+        "status": "success",
+        "data": results
+    })
+
+@app.route("/api/explain", methods=["POST"])
+@jwt_required()
+def explain_analysis():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({
+            "status": "error",
+            "message": "Analysis data is required"
+        }), 400
+
+    risk_score = data.get("risk_score")
+    risk_level = data.get("risk_level")
+    signals = data.get("signals", [])
+    webpage = data.get("webpage", {})
+
+    if risk_score is None or not risk_level:
+        return jsonify({
+            "status": "error",
+            "message": "Risk score and risk level are required"
+        }), 400
+
+    try:
+        explanation = generate_explanation(
+            risk_score=risk_score,
+            risk_level=risk_level,
+            signals=signals,
+            webpage=webpage
+        )
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "explanation": explanation
+            }
+        })
+
+    except Exception as error:
+        print("LLM Error:", error)
+
+        return jsonify({
+            "status": "error",
+            "message": "Unable to generate AI explanation"
+        }), 500
+
+# Create database tables if they don't exist
 with app.app_context():
     db.create_all()
+
 
 if __name__ == "__main__":
     app.run(debug=True)
